@@ -1,156 +1,235 @@
 # Obsidian Git Launcher
 
-A lightweight Windows utility that syncs your Obsidian vault with GitHub automatically — on every open and close.
+A tiny Windows launcher for syncing Obsidian vaults with GitHub.
 
-> "A safer, smarter doorway into Obsidian."
+Opens Obsidian, pulls before launch, pushes after exit.
 
 ---
 
-## How It Works
+## How it works
 
-When you run `launch.bat`:
+Instead of opening Obsidian directly, launch it through:
 
-1. Pulls latest changes from GitHub (`git pull --rebase`)
-2. Launches Obsidian and waits for you to close it
-3. Commits all your changes (`git add -A && git commit`)
-4. Pushes to GitHub
-5. Exits
+```bat
+launch.bat
+```
 
-That's it. No background processes. No daemons. No magic.
+The launcher:
+
+1. pulls the latest changes (`git pull --rebase`)
+2. opens Obsidian
+3. waits for Obsidian to close
+4. commits local changes
+5. pushes to GitHub
+
+That’s it.
 
 ---
 
 ## Requirements
 
-- Windows 10/11
-- [Git for Windows](https://git-scm.com/download/win) (with Git Credential Manager)
-- [Obsidian](https://obsidian.md/)
-- Your vault already initialized as a GitHub repo
+* Windows 10 / 11
+* Git for Windows
+  https://git-scm.com/download/win
+* Obsidian
+  https://obsidian.md/
+* GitHub repository for your vault
+
+During Git installation, keep **Git Credential Manager** enabled (default option).
 
 ---
 
-## Setup
+## Installation
 
-### 1. Clone or download this tool
+### Clone the repository
 
-```
+```bash
 git clone https://github.com/yourusername/obsidian-git-launcher.git
+cd obsidian-git-launcher
 ```
 
-### 2. Create your config
-
-```
-copy config.ini.example config.ini
-```
-
-Edit `config.ini` with your vault's details:
-
-```ini
-[MyVault]
-Path=C:\Vaults\Personal
-Remote=https://github.com/yourusername/my-vault.git
-Branch=main
-ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
-```
-
-### 3. Make sure your vault is a git repo
-
-```
-cd C:\Vaults\Personal
-git init
-git remote add origin https://github.com/yourusername/my-vault.git
-git branch -M main
-```
-
-### 4. Authenticate with GitHub (once)
-
-```
-git push -u origin main
-```
-
-Git Credential Manager will open a browser prompt. Log in once. Credentials are cached securely.
-
-### 5. Double-click `launch.bat`
-
-Use it as your default way to open Obsidian.
+Or download the latest ZIP from Releases.
 
 ---
 
-## Options (config.ini)
+## Initial setup
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `Path` | *(required)* | Absolute path to your vault |
-| `Remote` | *(required)* | GitHub HTTPS URL |
-| `Branch` | `main` | Branch to sync |
-| `ObsidianPath` | *(required)* | Path to `Obsidian.exe` |
-| `DryRun` | `false` | Log actions without pushing |
-| `BackupEnabled` | `false` | Zip snapshots before push |
-| `BackupDir` | `.\backups` | Where snapshots are saved |
-| `CommitMessage` | `vault sync: %DATE% %TIME%` | Commit message template |
+Run:
 
----
+```bat
+launch.bat
+```
 
-## Multi-Vault
+If `config.ini` does not exist, the setup wizard will create it automatically.
 
-Add multiple `[SectionName]` blocks in `config.ini`. Each vault syncs independently, in order.
+You’ll be asked for:
+
+* vault path
+* GitHub repository URL
+* branch name
+
+Example:
 
 ```ini
 [Personal]
 Path=C:\Vaults\Personal
-...
-
-[Work]
-Path=C:\Vaults\Work
-...
+Remote=https://github.com/yourusername/personal-vault.git
+Branch=main
+ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
 ```
 
 ---
 
-## Conflict Handling
+## Preparing your vault
 
-If a merge conflict is detected, the launcher **stops immediately** and tells you which files are affected. It will never auto-resolve or force-push.
+Your vault must already be a Git repository.
 
-Manual resolution:
+Example setup:
+
+```bash
+cd C:\Vaults\Personal
+
+git init
+git remote add origin https://github.com/yourusername/personal-vault.git
+
+git branch -M main
+git push -u origin main
 ```
+
+Authentication is handled through Git Credential Manager.
+
+On first push, GitHub login opens in your browser once and is then cached locally.
+
+---
+
+## Daily usage
+
+Use `launch.bat` as your main Obsidian shortcut.
+
+Recommended:
+
+* pin it to the taskbar
+* replace existing Obsidian shortcuts
+* launch vaults through the launcher only
+
+---
+
+## Multi-vault support
+
+Multiple vaults can be configured in `config.ini`.
+
+Vaults sync sequentially in the order they appear.
+
+```ini
+[Personal]
+Path=C:\Vaults\Personal
+Remote=https://github.com/you/personal-vault.git
+Branch=main
+ObsidianPath=C:\Users\You\AppData\Local\Obsidian\Obsidian.exe
+
+[Work]
+Path=C:\Vaults\Work
+Remote=https://github.com/you/work-vault.git
+Branch=main
+ObsidianPath=C:\Users\You\AppData\Local\Obsidian\Obsidian.exe
+```
+
+If one vault fails, the remaining vaults continue normally.
+
+---
+
+## Dry run mode
+
+Enable dry-run mode in `[Settings]`:
+
+```ini
+[Settings]
+DryRun=true
+```
+
+All actions are logged without modifying files or running Git operations.
+
+Useful for initial verification and debugging.
+
+---
+
+## Merge conflicts
+
+If a merge conflict is detected, the launcher stops immediately and prints the affected files.
+
+Nothing is auto-resolved or force-pushed.
+
+Resolve conflicts manually:
+
+```bash
 cd C:\Vaults\YourVault
+
 git status
-# fix the conflicted files
 git add -A
 git rebase --continue
 ```
+
+Then run `launch.bat` again.
 
 ---
 
 ## Logs
 
-Every run writes a log to `logs\sync_YYYY-MM-DD.log`.
+Logs are written to:
+
+```text
+logs\
+```
+
+Generated files:
+
+* `session_YYYY-MM-DD.log`
+* `VaultName_YYYY-MM-DD.log`
 
 ---
 
-## Dry Run
+## Task Scheduler (optional)
 
-Set `DryRun=true` in `[Settings]` to test the flow without committing or pushing. Useful before first use.
+The launcher can run automatically at login using Windows Task Scheduler.
 
----
+Basic setup:
 
-## Task Scheduler (Optional)
-
-To auto-launch on login instead of double-clicking, create a Task Scheduler entry pointing to `launch.bat`.
-
----
-
-## What This Is NOT
-
-- Not a background sync daemon (no FileSystemWatcher)
-- Not a cloud service
-- Not an Electron app
-- Not real-time collaboration
-
-It runs once, on-demand, when you open Obsidian.
+1. Open `taskschd.msc`
+2. Create a new task
+3. Trigger: `At log on`
+4. Action: start `launch.bat`
+5. Set “Start in” to the launcher directory
 
 ---
 
-## License
+## Configuration reference
 
-MIT
+```ini
+[VaultName]
+Path=
+Remote=
+Branch=main
+ObsidianPath=
+
+[Settings]
+DryRun=false
+CommitMessage=vault sync: %DATE% %TIME%
+BackupEnabled=false
+BackupDir=.\backups
+```
+
+---
+
+## Note
+
+This project is not:
+
+* a background sync daemon
+* a cloud sync platform
+* a real-time collaboration tool
+* an Obsidian plugin
+
+Sync runs only when the launcher is started.
+
+---
+made w ❤ by manasvi
