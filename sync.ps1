@@ -71,6 +71,25 @@ function Write-Log {
     Write-Host $line -ForegroundColor $color
 }
 
+# ── Write-VaultLog ────────────────────────────────────────────────────────────
+# Appends a timestamped line to the per-vault log file AND calls Write-Log so
+# the session transcript captures it too. No nested Start-Transcript needed.
+# $script:CurrentVaultLog is set by Sync-Vault at the start of each vault sync.
+$script:CurrentVaultLog = $null
+
+function Write-VaultLog {
+    param([string]$Message, [string]$Level = "INFO")
+
+    Write-Log $Message $Level
+
+    if ($script:CurrentVaultLog) {
+        $ts    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $label = $Level.PadRight(6)
+        $line  = "[$ts] [$label] $Message"
+        Add-Content -Path $script:CurrentVaultLog -Value $line -Encoding UTF8
+    }
+}
+
 # ── Fail ─────────────────────────────────────────────────────────────────────
 # Hard stop. Prints the error, tells the user where the log is, exits non-zero.
 function Fail {
@@ -469,7 +488,9 @@ function Invoke-Git {
 
     if ($exitCode -ne 0) {
         $detail = if ($stderrContent) { $stderrContent -join "`n" } else { $stdout -join "`n" }
-        Fail "$cmdStr failed (exit $exitCode)`n$detail"
+        # throw instead of Fail — lets the per-vault catch in MAIN record this
+        # failure and continue to the next vault rather than exiting the process.
+        throw "$cmdStr failed (exit $exitCode)`n$detail"
     }
 
     return $stdout
@@ -485,13 +506,12 @@ function Test-Conflicts {
     if ($conflicts) {
         Write-Log "Merge conflicts detected — manual resolution required:" "ERROR"
         $conflicts | ForEach-Object { Write-Log "  conflict: $_" "ERROR" }
-        Write-Log "" "ERROR"
         Write-Log "  To resolve:" "ERROR"
         Write-Log "    1. Open the conflicted files and fix the markers" "ERROR"
         Write-Log "    2. git add -A" "ERROR"
         Write-Log "    3. git rebase --continue" "ERROR"
         Write-Log "    4. Re-run launch.bat" "ERROR"
-        Fail "Halting. Vault: $VaultPath"
+        throw "Merge conflict in: $VaultPath"
     }
 }
 
@@ -500,13 +520,23 @@ function Test-Conflicts {
 function Test-RebaseInProgress {
     param([string]$VaultPath)
 
-    $gitDir       = & git -C $VaultPath rev-parse --git-dir 2>&1
-    $rebaseHead   = Join-Path $gitDir "REBASE_HEAD"
-    $rebaseMerge  = Join-Path $gitDir "rebase-merge"
-    $rebaseApply  = Join-Path $gitDir "rebase-apply"
+    $rawGitDir = & git -C $VaultPath rev-parse --git-dir 2>&1
+
+    # rev-parse --git-dir returns a path relative to $VaultPath when called
+    # via -C (e.g. ".git"). Resolve it to absolute before Join-Path so
+    # Test-Path works regardless of the script's working directory.
+    $gitDir = if ([System.IO.Path]::IsPathRooted($rawGitDir)) {
+        $rawGitDir
+    } else {
+        Join-Path $VaultPath $rawGitDir
+    }
+
+    $rebaseHead  = Join-Path $gitDir "REBASE_HEAD"
+    $rebaseMerge = Join-Path $gitDir "rebase-merge"
+    $rebaseApply = Join-Path $gitDir "rebase-apply"
 
     if ((Test-Path $rebaseHead) -or (Test-Path $rebaseMerge) -or (Test-Path $rebaseApply)) {
-        Fail "A rebase is already in progress in: $VaultPath`nResolve it manually:`n  git rebase --continue  (after fixing conflicts)`n  git rebase --abort     (to cancel and go back to pre-pull state)`nThen re-run launch.bat."
+        throw "Rebase already in progress in: $VaultPath`nRun: git rebase --continue  (after fixing conflicts)`n  or: git rebase --abort     (to reset to pre-pull state)`nThen re-run launch.bat."
     }
 }
 
@@ -538,11 +568,14 @@ function Sync-Vault {
     # Track whether we committed this session; gates the push step.
     $committed = $false
 
-    # ── Per-vault transcript ───────────────────────────────────────────────
-    # Start-Transcript is already running for the session; starting a second
-    # one here gives us a clean per-vault file without stopping the session one.
-    # PowerShell 5+ supports nested transcripts.
-    Start-Transcript -Path $VaultLog -Append | Out-Null
+    # ── Per-vault log ─────────────────────────────────────────────────────────
+    # Set the script-scoped vault log path so Write-VaultLog appends to it.
+    # We do NOT open a nested Start-Transcript — PowerShell 5.1 (the Windows
+    # default) supports only one active transcript; a second call silently
+    # stops the session transcript, breaking the cross-vault session log.
+    # Instead, Write-VaultLog calls Write-Log (captured by session transcript)
+    # AND appends the same line directly to the per-vault file via Add-Content.
+    $script:CurrentVaultLog = $VaultLog
 
     Write-Log "───────────────────────────────────────────────────"
     Write-Log "Vault : $VaultName"
@@ -553,17 +586,14 @@ function Sync-Vault {
     Write-Log "───────────────────────────────────────────────────"
 
     # ── Pre-flight validation ─────────────────────────────────────────────────
-    # These throw so the catch block in MAIN records the failure and moves on.
+    # throw — caught by the per-vault try/catch in MAIN, recorded, then moves on.
     if (-not (Test-Path $vaultPath)) {
-        Stop-Transcript | Out-Null
         throw "Vault path does not exist: $vaultPath"
     }
     if (-not (Test-Path (Join-Path $vaultPath ".git"))) {
-        Stop-Transcript | Out-Null
         throw "Not a git repository: $vaultPath"
     }
     if (-not (Test-Path $obsidianPath)) {
-        Stop-Transcript | Out-Null
         throw "Obsidian.exe not found: $obsidianPath"
     }
 
@@ -620,7 +650,6 @@ function Sync-Vault {
                 Write-Log "Obsidian exited with non-zero code $($obsidianProc.ExitCode). Continuing sync." "WARN"
             }
         } catch {
-            Stop-Transcript | Out-Null
             throw "Failed to launch Obsidian: $_"
         }
     }
@@ -673,8 +702,9 @@ function Sync-Vault {
 
     Write-Log "Vault sync complete: $VaultName" "OK"
 
-    # Stop the per-vault transcript cleanly.
-    Stop-Transcript | Out-Null
+    # Clear vault log path so stray Write-VaultLog calls after this point
+    # (there shouldn't be any) don't append to a finished vault's file.
+    $script:CurrentVaultLog = $null
 }
 
 # ─────────────────────────────────────────
