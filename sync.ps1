@@ -25,7 +25,10 @@ $ErrorActionPreference = "Stop"
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ConfigFile  = Join-Path $ScriptDir "config.ini"
 $LogDir      = Join-Path $ScriptDir "logs"
-$LogFile     = Join-Path $LogDir ("sync_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
+
+# Session-level log: one per day, captures the full run across all vaults.
+# Each vault also gets its own log file (see Get-VaultLogFile).
+$LogFile     = Join-Path $LogDir ("session_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 
 # ─────────────────────────────────────────
 # LOGGING SETUP
@@ -34,24 +37,101 @@ if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir | Out-Null
 }
 
+# Session start time — used in the summary footer.
+$script:SessionStart = Get-Date
+
+# Written to log once at startup; also tells the user where their log lives.
 Start-Transcript -Path $LogFile -Append | Out-Null
 
+# ── Write-Log ────────────────────────────────────────────────────────────────
+# Central log function. All output goes through here so the transcript captures
+# everything, and color keeps the terminal readable at a glance.
+#
+#   INFO    — white     normal progress
+#   OK      — green     step succeeded
+#   WARN    — yellow    non-fatal issue, user should know
+#   ERROR   — red       fatal, script will stop after this
+#   DRYRUN  — cyan      action skipped because dry-run is on
+#
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
+
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$ts] [$Level] $Message"
+    $label = $Level.PadRight(6)          # fixed-width so columns align in the log
+    $line  = "[$ts] [$label] $Message"
+
+    $color = switch ($Level) {
+        "OK"     { "Green"  }
+        "WARN"   { "Yellow" }
+        "ERROR"  { "Red"    }
+        "DRYRUN" { "Cyan"   }
+        default  { "White"  }
+    }
+
+    Write-Host $line -ForegroundColor $color
 }
 
+# ── Fail ─────────────────────────────────────────────────────────────────────
+# Hard stop. Prints the error, tells the user where the log is, exits non-zero.
 function Fail {
-    param([string]$Message)
+    param([string]$Message, [string]$VaultName = "")
+
+    Write-Host "" # blank line for breathing room
+    if ($VaultName) { Write-Log "Vault: $VaultName" "ERROR" }
     Write-Log $Message "ERROR"
+    Write-Log "Log file: $LogFile" "ERROR"
+    Write-Log "Exiting." "ERROR"
     Stop-Transcript | Out-Null
     exit 1
+}
+
+# ── Session header ────────────────────────────────────────────────────────────
+# Written once at the top of every run so logs are easy to scan by date.
+function Write-SessionHeader {
+    param([bool]$IsDryRun)
+
+    $mode = if ($IsDryRun) { "DRY RUN — no changes will be written" } else { "LIVE" }
+    Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-Log "  Obsidian Git Launcher"
+    Write-Log "  Mode    : $mode"
+    Write-Log "  Log     : $LogFile"
+    Write-Log "  Started : $($script:SessionStart.ToString('yyyy-MM-dd HH:mm:ss'))"
+    Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Session summary ───────────────────────────────────────────────────────────
+# Printed at normal exit so the user gets a one-glance confirmation.
+function Write-SessionSummary {
+    param(
+        [string[]]$VaultsSynced,
+        [hashtable[]]$VaultsFailed,
+        [bool]$IsDryRun
+    )
+
+    $elapsed = [math]::Round(((Get-Date) - $script:SessionStart).TotalSeconds, 1)
+    $mode    = if ($IsDryRun) { " (dry run — nothing was pushed)" } else { "" }
+
+    Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Write-Log "  Done in ${elapsed}s$mode"
+
+    foreach ($v in $VaultsSynced) {
+        Write-Log "  ✔ $v" "OK"
+    }
+    foreach ($f in $VaultsFailed) {
+        Write-Log "  ✘ $($f.Name) — $($f.Reason)" "ERROR"
+    }
+
+    Write-Log "  Log     : $LogFile"
+    Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # ─────────────────────────────────────────
 # CONFIG PARSER
 # ─────────────────────────────────────────
+
+# Returns a hashtable of [SectionName => @{key=value}] AND an ordered list of
+# vault section names. Hashtable keys have no guaranteed order in PowerShell;
+# we need insertion order so vaults sync in the same sequence as the file.
 function Read-IniFile {
     param([string]$Path)
 
@@ -60,7 +140,8 @@ function Read-IniFile {
         Invoke-SetupWizard -OutputPath $Path
     }
 
-    $ini = @{}
+    $ini          = @{}
+    $sectionOrder = [System.Collections.Generic.List[string]]::new()  # preserves INI file order
     $currentSection = "_root"
 
     foreach ($line in Get-Content $Path) {
@@ -70,6 +151,10 @@ function Read-IniFile {
         if ($line -match '^\[(.+)\]$') {
             $currentSection = $matches[1].Trim()
             $ini[$currentSection] = @{}
+            # Track non-root sections in order; duplicates are silently last-write-wins.
+            if ($currentSection -ne "_root" -and $sectionOrder -notcontains $currentSection) {
+                $sectionOrder.Add($currentSection)
+            }
         }
         elseif ($line -match '^([^=]+)=(.*)$') {
             $key   = $matches[1].Trim()
@@ -79,7 +164,29 @@ function Read-IniFile {
         }
     }
 
+    # Attach the ordered section list as a synthetic key so callers don't need
+    # a second return value. The leading underscore keeps it out of vault loops.
+    $ini["_sectionOrder"] = $sectionOrder
+
     return $ini
+}
+
+# Validate that a vault section has all required keys.
+# Returns a list of missing key names. Empty list = valid.
+function Get-MissingVaultKeys {
+    param([hashtable]$VaultConfig)
+
+    $required = @("Path", "Branch", "ObsidianPath")
+    return ($required | Where-Object { -not $VaultConfig.ContainsKey($_) -or -not $VaultConfig[$_] })
+}
+
+# Return the per-vault log file path for a given vault name.
+# Vault name is sanitised so it is safe as a filename.
+function Get-VaultLogFile {
+    param([string]$VaultName)
+
+    $safe = $VaultName -replace '[\\/:*?"<>|]', '_'
+    return Join-Path $LogDir ("${safe}_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 }
 
 # ─────────────────────────────────────────
@@ -329,26 +436,40 @@ function Write-IniConfig {
 # GIT HELPERS
 # ─────────────────────────────────────────
 function Invoke-Git {
-    param([string[]]$Arguments, [string]$WorkDir)
+    param(
+        [string[]]$Arguments,
+        [string]$WorkDir,
+        # When true: log the command but do not execute it.
+        # Used for write operations (add, commit, push) in dry-run mode.
+        # Read-only commands (fetch, pull --rebase) are also skipped in dry-run
+        # because they hit the network and could change local state.
+        [bool]$SkipInDryRun = $false,
+        [bool]$IsDryRun = $false
+    )
 
-    Write-Log "git $($Arguments -join ' ')"
+    $cmdStr = "git $($Arguments -join ' ')"
 
-    # Capture stdout and stderr separately so error messages aren't mangled
-    # into the return value on success paths.
-    $stdout = $null
-    $stderr = $null
-    $stdout = & git -C $WorkDir @Arguments 2>($stderr = [System.IO.Path]::GetTempFileName())
+    if ($SkipInDryRun -and $IsDryRun) {
+        Write-Log "[would run] $cmdStr" "DRYRUN"
+        return @()   # return empty so callers that use the result don't break
+    }
+
+    Write-Log "$cmdStr"
+
+    # Capture stdout and stderr separately so real error text surfaces cleanly.
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    $stdout = & git -C $WorkDir @Arguments 2>$stderrFile
     $exitCode = $LASTEXITCODE
-    $stderrContent = Get-Content $stderr -ErrorAction SilentlyContinue
-    Remove-Item $stderr -ErrorAction SilentlyContinue
+    $stderrContent = Get-Content $stderrFile -ErrorAction SilentlyContinue
+    Remove-Item $stderrFile -ErrorAction SilentlyContinue
 
-    if ($stdout)        { Write-Host $stdout }
-    if ($stderrContent) { Write-Host $stderrContent }
+    # Echo both streams so the transcript captures them.
+    if ($stdout)        { $stdout        | ForEach-Object { Write-Log "  $_" } }
+    if ($stderrContent) { $stderrContent | ForEach-Object { Write-Log "  $_" "WARN" } }
 
     if ($exitCode -ne 0) {
-        # Prefer stderr for the failure message; fall back to stdout.
         $detail = if ($stderrContent) { $stderrContent -join "`n" } else { $stdout -join "`n" }
-        Fail "git $($Arguments -join ' ') failed (exit $exitCode)`n$detail"
+        Fail "$cmdStr failed (exit $exitCode)`n$detail"
     }
 
     return $stdout
@@ -396,7 +517,10 @@ function Sync-Vault {
     param(
         [string]$VaultName,
         [hashtable]$VaultConfig,
-        [hashtable]$Settings
+        [hashtable]$Settings,
+        # Path to this vault's dedicated log file.
+        # Written alongside the session transcript for isolated debugging.
+        [string]$VaultLog
     )
 
     $vaultPath    = $VaultConfig["Path"]
@@ -411,136 +535,213 @@ function Sync-Vault {
         "vault sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     }
 
-    # Track whether we actually committed anything this session.
-    # Drives the push decision — no commit = no push needed.
+    # Track whether we committed this session; gates the push step.
     $committed = $false
 
-    Write-Log "═══ Starting sync: $VaultName ═══"
-    if ($dryRun) { Write-Log "[DRY RUN] No commits or pushes will occur." }
+    # ── Per-vault transcript ───────────────────────────────────────────────
+    # Start-Transcript is already running for the session; starting a second
+    # one here gives us a clean per-vault file without stopping the session one.
+    # PowerShell 5+ supports nested transcripts.
+    Start-Transcript -Path $VaultLog -Append | Out-Null
 
-    # ── Pre-flight validation ────────────────────────────────────────────────
+    Write-Log "───────────────────────────────────────────────────"
+    Write-Log "Vault : $VaultName"
+    Write-Log "Path  : $vaultPath"
+    Write-Log "Branch: $branch"
+    Write-Log "Log   : $VaultLog"
+    if ($dryRun) { Write-Log "Mode  : DRY RUN — no changes will be written" "DRYRUN" }
+    Write-Log "───────────────────────────────────────────────────"
+
+    # ── Pre-flight validation ─────────────────────────────────────────────────
+    # These throw so the catch block in MAIN records the failure and moves on.
     if (-not (Test-Path $vaultPath)) {
-        Fail "Vault path does not exist: $vaultPath"
+        Stop-Transcript | Out-Null
+        throw "Vault path does not exist: $vaultPath"
     }
     if (-not (Test-Path (Join-Path $vaultPath ".git"))) {
-        Fail "Not a git repository: $vaultPath"
+        Stop-Transcript | Out-Null
+        throw "Not a git repository: $vaultPath"
     }
     if (-not (Test-Path $obsidianPath)) {
-        Fail "Obsidian.exe not found: $obsidianPath"
+        Stop-Transcript | Out-Null
+        throw "Obsidian.exe not found: $obsidianPath"
     }
 
     # Catch a stuck rebase from a previous crashed run before we try to pull.
     Test-RebaseInProgress -VaultPath $vaultPath
 
-    # ── STEP 1: git fetch ────────────────────────────────────────────────────
-    # Fetch without merging so we have an accurate view of what's on the remote
-    # before we decide how to integrate it.
+    # ── STEP 1: git fetch ─────────────────────────────────────────────────────
+    # Skipped in dry-run: fetch hits the network and could fast-forward tracking
+    # refs, which is a real side effect. Dry-run should touch nothing.
     Write-Log "[1/5] Fetching remote..."
-    Invoke-Git @("fetch", "origin") -WorkDir $vaultPath
+    Invoke-Git @("fetch", "origin") `
+        -WorkDir $vaultPath `
+        -SkipInDryRun $true `
+        -IsDryRun $dryRun
 
-    # ── STEP 2: git pull --rebase ────────────────────────────────────────────
-    # Rebase instead of merge to keep vault history linear.
-    # A merge commit on every sync would pollute the log badly.
+    # ── STEP 2: git pull --rebase ─────────────────────────────────────────────
+    # Also skipped in dry-run for the same reason — it rewrites local commits.
+    # Rebase keeps vault history linear (no merge commits on every sync).
     Write-Log "[2/5] Rebasing onto origin/$branch..."
-    Invoke-Git @("pull", "--rebase", "origin", $branch) -WorkDir $vaultPath
+    Invoke-Git @("pull", "--rebase", "origin", $branch) `
+        -WorkDir $vaultPath `
+        -SkipInDryRun $true `
+        -IsDryRun $dryRun
 
-    # ── STEP 3: conflict detection ───────────────────────────────────────────
-    # Check immediately after rebase. If the rebase hit a conflict, git will
-    # have stopped mid-way and left conflict markers in the working tree.
-    # We must halt here — never auto-resolve, never continue past a conflict.
-    Test-RebaseInProgress -VaultPath $vaultPath
-    Test-Conflicts -VaultPath $vaultPath
-    Write-Log "[3/5] No conflicts. Launching Obsidian..."
+    # ── STEP 3: conflict detection ────────────────────────────────────────────
+    # In dry-run we skipped the pull, so there's nothing to check.
+    # In live mode: halt immediately if the rebase left conflict markers.
+    if (-not $dryRun) {
+        Test-RebaseInProgress -VaultPath $vaultPath
+        Test-Conflicts -VaultPath $vaultPath
+    }
+    Write-Log "[3/5] Launching Obsidian..." "OK"
 
-    # ── STEP 4: Launch Obsidian, wait for exit ───────────────────────────────
-    # -PassThru  : returns the Process object so we can inspect the exit code.
-    # -Wait      : blocks until the launched process AND its child processes exit.
-    #              Obsidian (Electron) spawns helper renderers; -Wait handles all
-    #              of them. .WaitForExit() alone only waits on the root PID.
+    # ── STEP 4: Launch Obsidian, wait for exit ────────────────────────────────
+    # -PassThru : gives us the Process object to read the exit code.
+    # -Wait     : blocks until Obsidian AND all its Electron child processes exit.
+    #             .WaitForExit() alone only waits on the root PID.
     if ($dryRun) {
-        Write-Log "[DRY RUN] Skipping Obsidian launch. Waiting 3s to simulate session."
-        Start-Sleep -Seconds 3
+        Write-Log "Skipping Obsidian launch — simulating 2s session." "DRYRUN"
+        Start-Sleep -Seconds 2
+        Write-Log "Simulated session complete." "DRYRUN"
     } else {
         try {
             $obsidianProc = Start-Process `
-                -FilePath  $obsidianPath `
+                -FilePath $obsidianPath `
                 -PassThru `
                 -Wait
 
-            Write-Log "Obsidian exited (PID $($obsidianProc.Id), code $($obsidianProc.ExitCode))."
+            Write-Log "Obsidian exited (PID $($obsidianProc.Id), code $($obsidianProc.ExitCode))." "OK"
 
-            # A non-zero exit from Obsidian is unusual but not necessarily fatal
-            # (e.g. crash). Log it loudly but continue — the vault files are fine.
+            # Non-zero exit is unusual (e.g. crash) but the vault files are fine.
+            # Log loudly and continue — do not abort the commit/push.
             if ($obsidianProc.ExitCode -ne 0) {
-                Write-Log "Obsidian exited with code $($obsidianProc.ExitCode) — unusual but continuing sync." "WARN"
+                Write-Log "Obsidian exited with non-zero code $($obsidianProc.ExitCode). Continuing sync." "WARN"
             }
         } catch {
-            Fail "Failed to launch Obsidian: $_"
+            Stop-Transcript | Out-Null
+            throw "Failed to launch Obsidian: $_"
         }
     }
 
-    # ── STEP 5: stage → commit → push ───────────────────────────────────────
-    Write-Log "[4/5] Checking for changes to commit..."
+    # ── STEP 5: stage + commit ────────────────────────────────────────────────
+    Write-Log "[4/5] Checking for changes..."
 
-    # Check status BEFORE staging. git status --porcelain is cheap and lets us
-    # skip add + commit entirely if the vault is unchanged.
+    # Check status BEFORE staging so we don't run add/commit on a clean tree.
     $preStageStatus = & git -C $vaultPath status --porcelain 2>&1
 
     if (-not $preStageStatus) {
-        Write-Log "No changes detected. Nothing to commit."
+        Write-Log "No changes — vault is clean."
     } else {
-        Write-Log "Changes found:"
+        Write-Log "Changes detected:"
         $preStageStatus | ForEach-Object { Write-Log "  $_" }
 
-        # Stage everything (new files, modifications, deletions).
-        Invoke-Git @("add", "-A") -WorkDir $vaultPath
+        # Stage all changes (new, modified, deleted).
+        Invoke-Git @("add", "-A") `
+            -WorkDir $vaultPath `
+            -SkipInDryRun $true `
+            -IsDryRun $dryRun
 
-        if ($dryRun) {
-            Write-Log "[DRY RUN] Would commit: $commitMsg"
-        } else {
-            Invoke-Git @("commit", "-m", $commitMsg) -WorkDir $vaultPath
+        Invoke-Git @("commit", "-m", $commitMsg) `
+            -WorkDir $vaultPath `
+            -SkipInDryRun $true `
+            -IsDryRun $dryRun
+
+        if (-not $dryRun) {
             $committed = $true
-            Write-Log "Committed: $commitMsg"
+            Write-Log "Committed: $commitMsg" "OK"
         }
     }
 
-    # ── STEP 6: push ─────────────────────────────────────────────────────────
-    # Only push if we actually made a new commit this session.
-    # Pushing with nothing new wastes a round-trip and can surface auth
-    # errors even when the vault is already in sync.
+    # ── STEP 6: push ──────────────────────────────────────────────────────────
+    # Only push if we actually committed something — avoids a pointless network
+    # round-trip (and possible auth prompt) when the vault is already in sync.
     Write-Log "[5/5] Push..."
 
-    if ($dryRun) {
-        Write-Log "[DRY RUN] Would push to origin/$branch."
-    } elseif ($committed) {
-        Invoke-Git @("push", "origin", $branch) -WorkDir $vaultPath
-        Write-Log "Pushed to origin/$branch."
+    if ($committed) {
+        Invoke-Git @("push", "origin", $branch) `
+            -WorkDir $vaultPath `
+            -SkipInDryRun $true `
+            -IsDryRun $dryRun
+        Write-Log "Pushed to origin/$branch." "OK"
+    } elseif ($dryRun) {
+        Write-Log "Would push to origin/$branch (skipped)." "DRYRUN"
     } else {
-        Write-Log "Nothing new to push."
+        Write-Log "Nothing to push."
     }
 
-    Write-Log "═══ Sync complete: $VaultName ═══"
+    Write-Log "Vault sync complete: $VaultName" "OK"
+
+    # Stop the per-vault transcript cleanly.
+    Stop-Transcript | Out-Null
 }
 
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-Write-Log "Obsidian Git Launcher starting"
-
 $config   = Read-IniFile -Path $ConfigFile
 $settings = if ($config.ContainsKey("Settings")) { $config["Settings"] } else { @{} }
+$isDryRun = ($settings["DryRun"] -eq "true")
 
-# Collect vault sections (anything that isn't [Settings])
-$vaultSections = $config.Keys | Where-Object { $_ -ne "Settings" -and $_ -ne "_root" }
+Write-SessionHeader -IsDryRun $isDryRun
+
+# Vault sections in INI file order (stored by parser as _sectionOrder).
+# Excludes [Settings] and internal parser keys.
+$vaultSections = $config["_sectionOrder"] | Where-Object { $_ -ne "Settings" }
 
 if (-not $vaultSections) {
     Fail "No vault sections found in config.ini. Add at least one [VaultName] section."
 }
 
+Write-Log "Vaults to sync: $($vaultSections -join ', ')"
+
+$synced = [System.Collections.Generic.List[string]]::new()
+$failed = [System.Collections.Generic.List[hashtable]]::new()
+
 foreach ($vaultName in $vaultSections) {
-    Sync-Vault -VaultName $vaultName -VaultConfig $config[$vaultName] -Settings $settings
+    # Validate required keys before handing off to Sync-Vault.
+    # A bad config entry shouldn't block other vaults.
+    $vaultConfig = $config[$vaultName]
+    $missing = Get-MissingVaultKeys -VaultConfig $vaultConfig
+
+    if ($missing) {
+        $reason = "Missing required keys in config.ini: $($missing -join ', ')"
+        Write-Log "Skipping '$vaultName': $reason" "WARN"
+        $failed.Add(@{ Name = $vaultName; Reason = $reason })
+        continue
+    }
+
+    # Per-vault log file — written in addition to the session log.
+    # The session transcript (Start-Transcript) already captures everything;
+    # per-vault logs give a clean isolated view for debugging a single vault.
+    $vaultLogFile = Get-VaultLogFile -VaultName $vaultName
+
+    try {
+        # Run the vault sync. Any unhandled terminating error is caught below.
+        Sync-Vault `
+            -VaultName   $vaultName `
+            -VaultConfig $vaultConfig `
+            -Settings    $settings `
+            -VaultLog    $vaultLogFile
+
+        $synced.Add($vaultName)
+
+    } catch {
+        # Catch-all for unexpected PowerShell terminating errors (not from Fail).
+        # Fail already calls exit 1, so this catches things like null refs, etc.
+        $reason = $_.Exception.Message
+        Write-Log "" "ERROR"
+        Write-Log "Unexpected error in vault '$vaultName': $reason" "ERROR"
+        Write-Log "Vault log: $vaultLogFile" "ERROR"
+        Write-Log "Continuing to next vault..." "WARN"
+        $failed.Add(@{ Name = $vaultName; Reason = $reason })
+    }
 }
 
-Write-Log "All vaults synced successfully."
+Write-SessionSummary -VaultsSynced $synced -VaultsFailed $failed -IsDryRun $isDryRun
+
 Stop-Transcript | Out-Null
-exit 0
+
+# Exit non-zero if any vault failed, so Task Scheduler / callers can detect partial failure.
+if ($failed.Count -gt 0) { exit 1 } else { exit 0 }
