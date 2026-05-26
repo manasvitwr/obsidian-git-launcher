@@ -56,7 +56,8 @@ function Read-IniFile {
     param([string]$Path)
 
     if (-not (Test-Path $Path)) {
-        Fail "config.ini not found at: $Path`nCopy config.ini.example to config.ini and fill in your vault details."
+        # First run — hand off to the interactive setup wizard instead of failing.
+        Invoke-SetupWizard -OutputPath $Path
     }
 
     $ini = @{}
@@ -79,6 +80,249 @@ function Read-IniFile {
     }
 
     return $ini
+}
+
+# ─────────────────────────────────────────
+# FIRST-RUN SETUP WIZARD
+# ─────────────────────────────────────────
+function Invoke-SetupWizard {
+    param([string]$OutputPath)
+
+    # ── Banner ───────────────────────────────
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════╗"
+    Write-Host "  ║     Obsidian Git Launcher — First Run    ║"
+    Write-Host "  ║  Let's set up your vault sync in 1 min.  ║"
+    Write-Host "  ╚══════════════════════════════════════════╝"
+    Write-Host ""
+    Write-Host "  No config.ini found. This wizard will create one."
+    Write-Host "  Press Ctrl+C at any time to cancel."
+    Write-Host ""
+
+    # ── Locate Obsidian.exe (once, shared across all vaults) ──
+    $obsidianPath = Find-ObsidianExe
+
+    # ── Vault collection loop ─────────────────
+    $vaults   = [System.Collections.Generic.List[hashtable]]::new()
+    $addMore  = $true
+    $vaultNum = 1
+
+    while ($addMore) {
+        Write-Host "  ── Vault $vaultNum ─────────────────────────────"
+        $vault = Read-VaultConfig -VaultNumber $vaultNum -ObsidianPath $obsidianPath
+        $vaults.Add($vault)
+
+        Write-Host ""
+        $another = Read-PromptValue `
+            -Prompt "  Add another vault? (y/N)" `
+            -Default "N" `
+            -AllowEmpty $true
+
+        $addMore = ($another -match '^[Yy]$')
+        $vaultNum++
+        Write-Host ""
+    }
+
+    # ── Global settings ───────────────────────
+    Write-Host "  ── Global Settings ─────────────────────────"
+    $dryRun = Read-PromptValue `
+        -Prompt "  Enable dry-run mode? Logs actions without pushing. (y/N)" `
+        -Default "N" `
+        -AllowEmpty $true
+    $dryRunValue = if ($dryRun -match '^[Yy]$') { "true" } else { "false" }
+
+    # ── Write config.ini ──────────────────────
+    Write-IniConfig -OutputPath $OutputPath -Vaults $vaults -DryRun $dryRunValue
+
+    Write-Host ""
+    Write-Host "  [OK] config.ini created at: $OutputPath"
+    Write-Host "  Starting sync now..."
+    Write-Host ""
+}
+
+# Prompt for one vault's settings and return a hashtable.
+function Read-VaultConfig {
+    param([int]$VaultNumber, [string]$ObsidianPath)
+
+    # ── Section name ──────────────────────────
+    $defaultName = "Vault$VaultNumber"
+    $sectionName = Read-PromptValue `
+        -Prompt "  Vault name (used in logs) [$defaultName]" `
+        -Default $defaultName `
+        -AllowEmpty $true
+    # Strip characters that would break INI section syntax
+    $sectionName = $sectionName -replace '[\[\]=;#]', '' | ForEach-Object { $_.Trim() }
+    if (-not $sectionName) { $sectionName = $defaultName }
+
+    # ── Vault path ────────────────────────────
+    $vaultPath = ""
+    do {
+        $vaultPath = Read-PromptValue `
+            -Prompt "  Vault folder path (e.g. C:\Vaults\Personal)" `
+            -Default "" `
+            -AllowEmpty $false
+
+        if (-not (Test-Path $vaultPath)) {
+            Write-Host "  [WARN] Path does not exist. Check the path and try again." -ForegroundColor Yellow
+            $vaultPath = ""
+        }
+    } while (-not $vaultPath)
+
+    # ── Git repo check / offer to init ────────
+    $gitDir = Join-Path $vaultPath ".git"
+    if (-not (Test-Path $gitDir)) {
+        Write-Host ""
+        Write-Host "  [WARN] This folder is not a git repo yet." -ForegroundColor Yellow
+        $doInit = Read-PromptValue `
+            -Prompt "  Initialise git repo here now? (Y/n)" `
+            -Default "Y" `
+            -AllowEmpty $true
+
+        if ($doInit -notmatch '^[Nn]$') {
+            & git -C $vaultPath init 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  [ERROR] git init failed. Is Git installed?" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  [OK] git repo initialised."
+        } else {
+            # User declined — warn but continue. Sync-Vault will catch it later.
+            Write-Host "  [WARN] Skipping git init. Sync will fail unless the folder is a git repo." -ForegroundColor Yellow
+        }
+    }
+
+    # ── Remote URL ────────────────────────────
+    $remote = ""
+    do {
+        $remote = Read-PromptValue `
+            -Prompt "  GitHub repo URL (HTTPS, e.g. https://github.com/you/vault.git)" `
+            -Default "" `
+            -AllowEmpty $false
+
+        if ($remote -notmatch '^https?://.+') {
+            Write-Host "  [WARN] URL should start with https://. Try again." -ForegroundColor Yellow
+            $remote = ""
+        }
+    } while (-not $remote)
+
+    # ── Branch ────────────────────────────────
+    $branch = Read-PromptValue `
+        -Prompt "  Branch name [main]" `
+        -Default "main" `
+        -AllowEmpty $true
+    if (-not $branch) { $branch = "main" }
+
+    # ── Wire up remote (if repo was just init'd or has no remote) ──
+    $existingRemote = & git -C $vaultPath remote get-url origin 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $existingRemote) {
+        & git -C $vaultPath remote add origin $remote 2>&1 | Out-Null
+        Write-Host "  [OK] Remote 'origin' set to $remote"
+    } else {
+        Write-Host "  [INFO] Remote 'origin' already exists: $existingRemote"
+    }
+
+    return @{
+        SectionName  = $sectionName
+        Path         = $vaultPath
+        Remote       = $remote
+        Branch       = $branch
+        ObsidianPath = $ObsidianPath
+    }
+}
+
+# Locate Obsidian.exe — check common install paths, then ask the user.
+function Find-ObsidianExe {
+    $candidates = @(
+        "$env:LOCALAPPDATA\Obsidian\Obsidian.exe",
+        "$env:PROGRAMFILES\Obsidian\Obsidian.exe",
+        "${env:PROGRAMFILES(x86)}\Obsidian\Obsidian.exe"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            Write-Host "  [OK] Obsidian found at: $candidate"
+            $confirm = Read-PromptValue `
+                -Prompt "  Use this path? (Y/n)" `
+                -Default "Y" `
+                -AllowEmpty $true
+            if ($confirm -notmatch '^[Nn]$') {
+                return $candidate
+            }
+        }
+    }
+
+    # Manual entry fallback
+    $obsidianPath = ""
+    do {
+        $obsidianPath = Read-PromptValue `
+            -Prompt "  Path to Obsidian.exe" `
+            -Default "" `
+            -AllowEmpty $false
+
+        if (-not (Test-Path $obsidianPath)) {
+            Write-Host "  [WARN] File not found at that path. Try again." -ForegroundColor Yellow
+            $obsidianPath = ""
+        }
+    } while (-not $obsidianPath)
+
+    return $obsidianPath
+}
+
+# Generic prompt helper — shows default, returns trimmed input or default if empty.
+function Read-PromptValue {
+    param(
+        [string]$Prompt,
+        [string]$Default,
+        [bool]$AllowEmpty = $false
+    )
+
+    while ($true) {
+        Write-Host -NoNewline "$Prompt : "
+        $raw = $Host.UI.ReadLine()
+        $value = $raw.Trim()
+
+        if ($value -eq "" -and $Default -ne "") {
+            return $Default
+        }
+        if ($value -ne "" -or $AllowEmpty) {
+            return $value
+        }
+        Write-Host "  [WARN] This field is required." -ForegroundColor Yellow
+    }
+}
+
+# Serialise collected vault data to a clean config.ini file.
+function Write-IniConfig {
+    param(
+        [string]$OutputPath,
+        [System.Collections.Generic.List[hashtable]]$Vaults,
+        [string]$DryRun
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    $lines.Add("; Obsidian Git Launcher — config.ini")
+    $lines.Add("; Generated by setup wizard on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $lines.Add("; Edit this file any time to update your settings.")
+    $lines.Add("")
+
+    foreach ($vault in $Vaults) {
+        $lines.Add("[$($vault.SectionName)]")
+        $lines.Add("Path=$($vault.Path)")
+        $lines.Add("Remote=$($vault.Remote)")
+        $lines.Add("Branch=$($vault.Branch)")
+        $lines.Add("ObsidianPath=$($vault.ObsidianPath)")
+        $lines.Add("")
+    }
+
+    $lines.Add("[Settings]")
+    $lines.Add("DryRun=$DryRun")
+    $lines.Add("BackupEnabled=false")
+    $lines.Add("BackupDir=.\backups")
+    $lines.Add("CommitMessage=vault sync: %DATE% %TIME%")
+
+    # Write atomically — build in memory, write once.
+    $lines | Set-Content -Path $OutputPath -Encoding UTF8
 }
 
 # ─────────────────────────────────────────
