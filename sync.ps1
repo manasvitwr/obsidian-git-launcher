@@ -332,17 +332,29 @@ function Invoke-Git {
     param([string[]]$Arguments, [string]$WorkDir)
 
     Write-Log "git $($Arguments -join ' ')"
-    $result = & git -C $WorkDir @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
 
-    if ($result) { Write-Host $result }
+    # Capture stdout and stderr separately so error messages aren't mangled
+    # into the return value on success paths.
+    $stdout = $null
+    $stderr = $null
+    $stdout = & git -C $WorkDir @Arguments 2>($stderr = [System.IO.Path]::GetTempFileName())
+    $exitCode = $LASTEXITCODE
+    $stderrContent = Get-Content $stderr -ErrorAction SilentlyContinue
+    Remove-Item $stderr -ErrorAction SilentlyContinue
+
+    if ($stdout)        { Write-Host $stdout }
+    if ($stderrContent) { Write-Host $stderrContent }
 
     if ($exitCode -ne 0) {
-        Fail "git $($Arguments -join ' ') failed (exit $exitCode)`n$result"
+        # Prefer stderr for the failure message; fall back to stdout.
+        $detail = if ($stderrContent) { $stderrContent -join "`n" } else { $stdout -join "`n" }
+        Fail "git $($Arguments -join ' ') failed (exit $exitCode)`n$detail"
     }
-    return $result
+
+    return $stdout
 }
 
+# Check porcelain status for conflict markers (UU, AA, DD, AU, UA, DU, UD).
 function Test-Conflicts {
     param([string]$VaultPath)
 
@@ -351,8 +363,29 @@ function Test-Conflicts {
 
     if ($conflicts) {
         Write-Log "Merge conflicts detected — manual resolution required:" "ERROR"
-        $conflicts | ForEach-Object { Write-Log "  $_" "ERROR" }
-        Fail "Resolve conflicts manually in: $VaultPath`nDo NOT force-push. Fix the files, then run: git add -A && git rebase --continue"
+        $conflicts | ForEach-Object { Write-Log "  conflict: $_" "ERROR" }
+        Write-Log "" "ERROR"
+        Write-Log "  To resolve:" "ERROR"
+        Write-Log "    1. Open the conflicted files and fix the markers" "ERROR"
+        Write-Log "    2. git add -A" "ERROR"
+        Write-Log "    3. git rebase --continue" "ERROR"
+        Write-Log "    4. Re-run launch.bat" "ERROR"
+        Fail "Halting. Vault: $VaultPath"
+    }
+}
+
+# Detect a stuck mid-rebase state (REBASE_HEAD exists in the git dir).
+# This can happen if the user Ctrl+C'd a previous run during pull --rebase.
+function Test-RebaseInProgress {
+    param([string]$VaultPath)
+
+    $gitDir       = & git -C $VaultPath rev-parse --git-dir 2>&1
+    $rebaseHead   = Join-Path $gitDir "REBASE_HEAD"
+    $rebaseMerge  = Join-Path $gitDir "rebase-merge"
+    $rebaseApply  = Join-Path $gitDir "rebase-apply"
+
+    if ((Test-Path $rebaseHead) -or (Test-Path $rebaseMerge) -or (Test-Path $rebaseApply)) {
+        Fail "A rebase is already in progress in: $VaultPath`nResolve it manually:`n  git rebase --continue  (after fixing conflicts)`n  git rebase --abort     (to cancel and go back to pre-pull state)`nThen re-run launch.bat."
     }
 }
 
@@ -366,11 +399,11 @@ function Sync-Vault {
         [hashtable]$Settings
     )
 
-    $vaultPath     = $VaultConfig["Path"]
-    $branch        = $VaultConfig["Branch"]
-    $obsidianPath  = $VaultConfig["ObsidianPath"]
-    $dryRun        = ($Settings -and $Settings["DryRun"] -eq "true")
-    $commitMsg     = if ($Settings -and $Settings["CommitMessage"]) {
+    $vaultPath    = $VaultConfig["Path"]
+    $branch       = $VaultConfig["Branch"]
+    $obsidianPath = $VaultConfig["ObsidianPath"]
+    $dryRun       = ($Settings -and $Settings["DryRun"] -eq "true")
+    $commitMsg    = if ($Settings -and $Settings["CommitMessage"]) {
         $Settings["CommitMessage"] `
             -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd") `
             -replace "%TIME%", (Get-Date -Format "HH:mm:ss")
@@ -378,72 +411,115 @@ function Sync-Vault {
         "vault sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     }
 
-    Write-Log "─── Starting sync for vault: $VaultName ───"
+    # Track whether we actually committed anything this session.
+    # Drives the push decision — no commit = no push needed.
+    $committed = $false
 
-    # Validate vault path
+    Write-Log "═══ Starting sync: $VaultName ═══"
+    if ($dryRun) { Write-Log "[DRY RUN] No commits or pushes will occur." }
+
+    # ── Pre-flight validation ────────────────────────────────────────────────
     if (-not (Test-Path $vaultPath)) {
         Fail "Vault path does not exist: $vaultPath"
     }
     if (-not (Test-Path (Join-Path $vaultPath ".git"))) {
-        Fail "Vault path is not a git repository: $vaultPath"
+        Fail "Not a git repository: $vaultPath"
     }
-
-    # Validate Obsidian executable
     if (-not (Test-Path $obsidianPath)) {
-        Fail "Obsidian.exe not found at: $obsidianPath"
+        Fail "Obsidian.exe not found: $obsidianPath"
     }
 
-    # ── STEP 1: Pull latest ──────────────────
-    Write-Log "Fetching remote changes..."
+    # Catch a stuck rebase from a previous crashed run before we try to pull.
+    Test-RebaseInProgress -VaultPath $vaultPath
+
+    # ── STEP 1: git fetch ────────────────────────────────────────────────────
+    # Fetch without merging so we have an accurate view of what's on the remote
+    # before we decide how to integrate it.
+    Write-Log "[1/5] Fetching remote..."
     Invoke-Git @("fetch", "origin") -WorkDir $vaultPath
+
+    # ── STEP 2: git pull --rebase ────────────────────────────────────────────
+    # Rebase instead of merge to keep vault history linear.
+    # A merge commit on every sync would pollute the log badly.
+    Write-Log "[2/5] Rebasing onto origin/$branch..."
     Invoke-Git @("pull", "--rebase", "origin", $branch) -WorkDir $vaultPath
+
+    # ── STEP 3: conflict detection ───────────────────────────────────────────
+    # Check immediately after rebase. If the rebase hit a conflict, git will
+    # have stopped mid-way and left conflict markers in the working tree.
+    # We must halt here — never auto-resolve, never continue past a conflict.
+    Test-RebaseInProgress -VaultPath $vaultPath
     Test-Conflicts -VaultPath $vaultPath
+    Write-Log "[3/5] No conflicts. Launching Obsidian..."
 
-    # ── STEP 2: Launch Obsidian ──────────────
-    Write-Log "Launching Obsidian: $obsidianPath"
-
+    # ── STEP 4: Launch Obsidian, wait for exit ───────────────────────────────
+    # -PassThru  : returns the Process object so we can inspect the exit code.
+    # -Wait      : blocks until the launched process AND its child processes exit.
+    #              Obsidian (Electron) spawns helper renderers; -Wait handles all
+    #              of them. .WaitForExit() alone only waits on the root PID.
     if ($dryRun) {
-        Write-Log "[DRY RUN] Would launch Obsidian. Skipping." "INFO"
-        Write-Log "[DRY RUN] Simulating 3 second wait..." "INFO"
+        Write-Log "[DRY RUN] Skipping Obsidian launch. Waiting 3s to simulate session."
         Start-Sleep -Seconds 3
     } else {
         try {
-            # -PassThru gives us the process object. -Wait isn't used here because
-            # Obsidian (Electron) spawns child processes — we wait on the parent.
-            $obsidianProc = Start-Process -FilePath $obsidianPath -PassThru
-            Write-Log "Obsidian launched (PID $($obsidianProc.Id)). Waiting for it to close..."
-            $obsidianProc.WaitForExit()
-            Write-Log "Obsidian closed."
+            $obsidianProc = Start-Process `
+                -FilePath  $obsidianPath `
+                -PassThru `
+                -Wait
+
+            Write-Log "Obsidian exited (PID $($obsidianProc.Id), code $($obsidianProc.ExitCode))."
+
+            # A non-zero exit from Obsidian is unusual but not necessarily fatal
+            # (e.g. crash). Log it loudly but continue — the vault files are fine.
+            if ($obsidianProc.ExitCode -ne 0) {
+                Write-Log "Obsidian exited with code $($obsidianProc.ExitCode) — unusual but continuing sync." "WARN"
+            }
         } catch {
             Fail "Failed to launch Obsidian: $_"
         }
     }
 
-    # ── STEP 3: Commit changes ───────────────
-    Write-Log "Staging all changes..."
-    Invoke-Git @("add", "-A") -WorkDir $vaultPath
+    # ── STEP 5: stage → commit → push ───────────────────────────────────────
+    Write-Log "[4/5] Checking for changes to commit..."
 
-    # Check if there's anything to commit
-    $statusOutput = & git -C $vaultPath status --porcelain 2>&1
-    if (-not $statusOutput) {
-        Write-Log "No changes to commit. Vault is already up to date."
+    # Check status BEFORE staging. git status --porcelain is cheap and lets us
+    # skip add + commit entirely if the vault is unchanged.
+    $preStageStatus = & git -C $vaultPath status --porcelain 2>&1
+
+    if (-not $preStageStatus) {
+        Write-Log "No changes detected. Nothing to commit."
     } else {
+        Write-Log "Changes found:"
+        $preStageStatus | ForEach-Object { Write-Log "  $_" }
+
+        # Stage everything (new files, modifications, deletions).
+        Invoke-Git @("add", "-A") -WorkDir $vaultPath
+
         if ($dryRun) {
-            Write-Log "[DRY RUN] Would commit: $commitMsg" "INFO"
+            Write-Log "[DRY RUN] Would commit: $commitMsg"
         } else {
             Invoke-Git @("commit", "-m", $commitMsg) -WorkDir $vaultPath
+            $committed = $true
+            Write-Log "Committed: $commitMsg"
         }
     }
 
-    # ── STEP 4: Push ─────────────────────────
+    # ── STEP 6: push ─────────────────────────────────────────────────────────
+    # Only push if we actually made a new commit this session.
+    # Pushing with nothing new wastes a round-trip and can surface auth
+    # errors even when the vault is already in sync.
+    Write-Log "[5/5] Push..."
+
     if ($dryRun) {
-        Write-Log "[DRY RUN] Would push to origin/$branch. Skipping." "INFO"
-    } else {
-        Write-Log "Pushing to origin/$branch..."
+        Write-Log "[DRY RUN] Would push to origin/$branch."
+    } elseif ($committed) {
         Invoke-Git @("push", "origin", $branch) -WorkDir $vaultPath
+        Write-Log "Pushed to origin/$branch."
+    } else {
+        Write-Log "Nothing new to push."
     }
 
-    Write-Log "─── Vault sync complete: $VaultName ───"
+    Write-Log "═══ Sync complete: $VaultName ═══"
 }
 
 # ─────────────────────────────────────────
