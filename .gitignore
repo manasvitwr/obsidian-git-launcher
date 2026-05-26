@@ -1,0 +1,21 @@
+# Obsidian Git Launcher — .gitignore
+
+# ─── User config (contains personal vault paths) ───
+config.ini
+
+# ─── Logs ───
+logs/
+
+# ─── Backup snapshots ───
+backups/
+
+# ─── Windows artifacts ───
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ─── Editor artifacts ───
+.vscode/
+.idea/
+*.swp
+*~

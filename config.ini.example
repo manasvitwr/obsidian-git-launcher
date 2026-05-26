@@ -1,0 +1,38 @@
+; Obsidian Git Launcher — Configuration
+; Copy this file to config.ini and fill in your values.
+; One [Section] per vault. Section name is used for display/logging only.
+
+; ─────────────────────────────────────────
+; VAULT EXAMPLE (rename [Vault1] to anything)
+; ─────────────────────────────────────────
+[Vault1]
+; Absolute path to the local vault folder (must be a git repo)
+Path=C:\Vaults\Personal
+; GitHub remote URL (HTTPS recommended — works with Git Credential Manager)
+Remote=https://github.com/yourusername/your-vault-repo.git
+; Branch to sync against
+Branch=main
+; Path to Obsidian executable (default works for most installs)
+ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
+
+; ─────────────────────────────────────────
+; SECOND VAULT EXAMPLE (optional)
+; ─────────────────────────────────────────
+; [WorkVault]
+; Path=C:\Vaults\Work
+; Remote=https://github.com/yourusername/work-vault.git
+; Branch=main
+; ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
+
+; ─────────────────────────────────────────
+; OPTIONAL SETTINGS
+; ─────────────────────────────────────────
+[Settings]
+; Enable backup snapshots before push (true/false)
+BackupEnabled=false
+; Directory for backup zip snapshots (relative or absolute)
+BackupDir=.\backups
+; Dry run mode — logs all actions but does NOT push or commit (true/false)
+DryRun=false
+; Commit message template (%DATE% and %TIME% are substituted automatically)
+CommitMessage=vault sync: %DATE% %TIME%
