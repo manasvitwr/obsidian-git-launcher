@@ -100,7 +100,7 @@ function Fail {
     Write-Log $Message "ERROR"
     Write-Log "Log file: $LogFile" "ERROR"
     Write-Log "Exiting." "ERROR"
-    Stop-Transcript | Out-Null
+    try { Stop-Transcript | Out-Null } catch { }
     exit 1
 }
 
@@ -676,7 +676,7 @@ function Sync-Vault {
         try {
             $obsidianProc = Start-Process `
                 -FilePath $obsidianPath `
-                -ArgumentList ('"obsidian://open?path={0}"' -f [uri]::EscapeDataString($vaultPath)) `
+                -ArgumentList ('"obsidian://open?path={0}"' -f [uri]::EscapeDataString($vaultPath.Replace('\', '/'))) `
                 -PassThru `
                 -Wait
 
@@ -830,7 +830,7 @@ foreach ($vaultName in $vaultSections) {
 
 Write-SessionSummary -VaultsSynced $synced -VaultsFailed $failed -IsDryRun $isDryRun
 
-Stop-Transcript | Out-Null
+try { Stop-Transcript | Out-Null } catch { }
 
 # Exit non-zero if any vault failed, so Task Scheduler / callers can detect partial failure.
 if ($failed.Count -gt 0) { exit 1 } else { exit 0 }
