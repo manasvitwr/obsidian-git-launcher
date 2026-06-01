@@ -676,7 +676,7 @@ function Sync-Vault {
         try {
             $obsidianProc = Start-Process `
                 -FilePath $obsidianPath `
-                -ArgumentList ('"obsidian://open?path={0}"' -f [uri]::EscapeDataString($vaultPath.Replace('\', '/'))) `
+                -ArgumentList ("obsidian://open?path={0}" -f [uri]::EscapeDataString($vaultPath.Replace('\', '/'))) `
                 -PassThru `
                 -Wait
 
@@ -737,6 +737,12 @@ function Sync-Vault {
             $pushNeeded = $true
         }
         elseif ($LASTEXITCODE -ne 0) {
+            # rev-list failed — likely because origin/$branch doesn't exist yet.
+            # Check whether the remote has the branch at all before deciding to push.
+            $lsRemote = & git -C $vaultPath ls-remote --heads origin $branch 2>&1
+            if ($LASTEXITCODE -eq 0 -and -not $lsRemote) {
+                Write-Log "Branch '$branch' not found on remote — will push to create it." "WARN"
+            }
             $pushNeeded = $true
         }
         else {
