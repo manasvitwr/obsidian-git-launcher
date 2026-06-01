@@ -22,13 +22,13 @@ $ErrorActionPreference = "Stop"
 # ─────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────
-$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$ConfigFile  = Join-Path $ScriptDir "config.ini"
-$LogDir      = Join-Path $ScriptDir "logs"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ConfigFile = Join-Path $ScriptDir "config.ini"
+$LogDir = Join-Path $ScriptDir "logs"
 
 # Session-level log: one per day, captures the full run across all vaults.
 # Each vault also gets its own log file (see Get-VaultLogFile).
-$LogFile     = Join-Path $LogDir ("session_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
+$LogFile = Join-Path $LogDir ("session_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 
 # ─────────────────────────────────────────
 # LOGGING SETUP
@@ -58,14 +58,14 @@ function Write-Log {
 
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $label = $Level.PadRight(6)          # fixed-width so columns align in the log
-    $line  = "[$ts] [$label] $Message"
+    $line = "[$ts] [$label] $Message"
 
     $color = switch ($Level) {
-        "OK"     { "Green"  }
-        "WARN"   { "Yellow" }
-        "ERROR"  { "Red"    }
-        "DRYRUN" { "Cyan"   }
-        default  { "White"  }
+        "OK" { "Green" }
+        "WARN" { "Yellow" }
+        "ERROR" { "Red" }
+        "DRYRUN" { "Cyan" }
+        default { "White" }
     }
 
     Write-Host $line -ForegroundColor $color
@@ -83,9 +83,9 @@ function Write-VaultLog {
     Write-Log $Message $Level
 
     if ($script:CurrentVaultLog) {
-        $ts    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $label = $Level.PadRight(6)
-        $line  = "[$ts] [$label] $Message"
+        $line = "[$ts] [$label] $Message"
         Add-Content -Path $script:CurrentVaultLog -Value $line -Encoding UTF8
     }
 }
@@ -128,7 +128,7 @@ function Write-SessionSummary {
     )
 
     $elapsed = [math]::Round(((Get-Date) - $script:SessionStart).TotalSeconds, 1)
-    $mode    = if ($IsDryRun) { " (dry run — nothing was pushed)" } else { "" }
+    $mode = if ($IsDryRun) { " (dry run — nothing was pushed)" } else { "" }
 
     Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     Write-Log "  Done in ${elapsed}s$mode"
@@ -159,7 +159,7 @@ function Read-IniFile {
         Invoke-SetupWizard -OutputPath $Path
     }
 
-    $ini          = @{}
+    $ini = @{}
     $sectionOrder = [System.Collections.Generic.List[string]]::new()  # preserves INI file order
     $currentSection = "_root"
 
@@ -176,7 +176,7 @@ function Read-IniFile {
             }
         }
         elseif ($line -match '^([^=]+)=(.*)$') {
-            $key   = $matches[1].Trim()
+            $key = $matches[1].Trim()
             $value = $matches[2].Trim()
             if (-not $ini.ContainsKey($currentSection)) { $ini[$currentSection] = @{} }
             $ini[$currentSection][$key] = $value
@@ -229,8 +229,8 @@ function Invoke-SetupWizard {
     $obsidianPath = Find-ObsidianExe
 
     # ── Vault collection loop ─────────────────
-    $vaults   = [System.Collections.Generic.List[hashtable]]::new()
-    $addMore  = $true
+    $vaults = [System.Collections.Generic.List[hashtable]]::new()
+    $addMore = $true
     $vaultNum = 1
 
     while ($addMore) {
@@ -311,7 +311,8 @@ function Read-VaultConfig {
                 exit 1
             }
             Write-Host "  [OK] git repo initialised."
-        } else {
+        }
+        else {
             # User declined — warn but continue. Sync-Vault will catch it later.
             Write-Host "  [WARN] Skipping git init. Sync will fail unless the folder is a git repo." -ForegroundColor Yellow
         }
@@ -325,8 +326,8 @@ function Read-VaultConfig {
             -Default "" `
             -AllowEmpty $false
 
-        if ($remote -notmatch '^https?://.+') {
-            Write-Host "  [WARN] URL should start with https://. Try again." -ForegroundColor Yellow
+        if ($remote -notmatch '^https?://[^\r\n]+$') {
+            Write-Host "  [WARN] URL should start with https:// and contain no line breaks. Try again." -ForegroundColor Yellow
             $remote = ""
         }
     } while (-not $remote)
@@ -343,7 +344,8 @@ function Read-VaultConfig {
     if ($LASTEXITCODE -ne 0 -or -not $existingRemote) {
         & git -C $vaultPath remote add origin $remote 2>&1 | Out-Null
         Write-Host "  [OK] Remote 'origin' set to $remote"
-    } else {
+    }
+    else {
         Write-Host "  [INFO] Remote 'origin' already exists: $existingRemote"
     }
 
@@ -433,11 +435,18 @@ function Write-IniConfig {
     $lines.Add("")
 
     foreach ($vault in $Vaults) {
-        $lines.Add("[$($vault.SectionName)]")
-        $lines.Add("Path=$($vault.Path)")
-        $lines.Add("Remote=$($vault.Remote)")
-        $lines.Add("Branch=$($vault.Branch)")
-        $lines.Add("ObsidianPath=$($vault.ObsidianPath)")
+        # Strip CR/LF and block INI metacharacters (= ; #) from all written values.
+        $safeSectionName = $vault.SectionName -replace '[\r\n=;#]', ''
+        $safePath = $vault.Path -replace '[\r\n]', ''
+        $safeRemote = $vault.Remote -replace '[\r\n]', ''
+        $safeBranch = $vault.Branch -replace '[\r\n=;#]', ''
+        $safeObsidianPath = $vault.ObsidianPath -replace '[\r\n]', ''
+
+        $lines.Add("[$safeSectionName]")
+        $lines.Add("Path=$safePath")
+        $lines.Add("Remote=$safeRemote")
+        $lines.Add("Branch=$safeBranch")
+        $lines.Add("ObsidianPath=$safeObsidianPath")
         $lines.Add("")
     }
 
@@ -483,7 +492,7 @@ function Invoke-Git {
     Remove-Item $stderrFile -ErrorAction SilentlyContinue
 
     # Echo both streams so the transcript captures them.
-    if ($stdout)        { $stdout        | ForEach-Object { Write-Log "  $_" } }
+    if ($stdout) { $stdout        | ForEach-Object { Write-Log "  $_" } }
     if ($stderrContent) { $stderrContent | ForEach-Object { Write-Log "  $_" "WARN" } }
 
     if ($exitCode -ne 0) {
@@ -527,11 +536,12 @@ function Test-RebaseInProgress {
     # Test-Path works regardless of the script's working directory.
     $gitDir = if ([System.IO.Path]::IsPathRooted($rawGitDir)) {
         $rawGitDir
-    } else {
+    }
+    else {
         Join-Path $VaultPath $rawGitDir
     }
 
-    $rebaseHead  = Join-Path $gitDir "REBASE_HEAD"
+    $rebaseHead = Join-Path $gitDir "REBASE_HEAD"
     $rebaseMerge = Join-Path $gitDir "rebase-merge"
     $rebaseApply = Join-Path $gitDir "rebase-apply"
 
@@ -553,15 +563,16 @@ function Sync-Vault {
         [string]$VaultLog
     )
 
-    $vaultPath    = $VaultConfig["Path"]
-    $branch       = $VaultConfig["Branch"]
+    $vaultPath = $VaultConfig["Path"]
+    $branch = $VaultConfig["Branch"]
     $obsidianPath = $VaultConfig["ObsidianPath"]
-    $dryRun       = ($Settings -and $Settings["DryRun"] -eq "true")
-    $commitMsg    = if ($Settings -and $Settings["CommitMessage"]) {
+    $dryRun = ($Settings -and $Settings["DryRun"] -eq "true")
+    $commitMsg = if ($Settings -and $Settings["CommitMessage"]) {
         $Settings["CommitMessage"] `
             -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd") `
             -replace "%TIME%", (Get-Date -Format "HH:mm:ss")
-    } else {
+    }
+    else {
         "vault sync: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     }
 
@@ -593,12 +604,37 @@ function Sync-Vault {
     if (-not (Test-Path (Join-Path $vaultPath ".git"))) {
         throw "Not a git repository: $vaultPath"
     }
-    if (-not (Test-Path $obsidianPath)) {
-        throw "Obsidian.exe not found: $obsidianPath"
+    # Validate ObsidianPath: must resolve to an absolute path, leaf must be
+    # Obsidian.exe (case-insensitive), and must contain no newlines or shell
+    # metacharacters that could escape Start-Process argument handling.
+    if ($obsidianPath -match '[\r\n&|;`$<>]') {
+        throw "ObsidianPath contains disallowed characters: $obsidianPath"
     }
+    $obsidianResolved = [System.IO.Path]::GetFullPath($obsidianPath)
+    $obsidianLeaf = [System.IO.Path]::GetFileName($obsidianResolved)
+    if ($obsidianLeaf -ne 'Obsidian.exe') {
+        throw "ObsidianPath leaf must be 'Obsidian.exe' (got '$obsidianLeaf'): $obsidianResolved"
+    }
+    if (-not (Test-Path $obsidianResolved)) {
+        throw "Obsidian.exe not found: $obsidianResolved"
+    }
+    $obsidianPath = $obsidianResolved
 
     # Catch a stuck rebase from a previous crashed run before we try to pull.
     Test-RebaseInProgress -VaultPath $vaultPath
+
+    $remote = $VaultConfig["Remote"]
+    if ($remote) {
+        $existingRemote = & git -C $vaultPath remote get-url origin 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not $existingRemote) {
+            & git -C $vaultPath remote add origin $remote 2>&1 | Out-Null
+            Write-Log "Remote 'origin' added as $remote" "OK"
+        }
+        elseif ($existingRemote.Trim() -ne $remote) {
+            & git -C $vaultPath remote set-url origin $remote 2>&1 | Out-Null
+            Write-Log "Remote 'origin' updated to $remote" "OK"
+        }
+    }
 
     # ── STEP 1: git fetch ─────────────────────────────────────────────────────
     # Skipped in dry-run: fetch hits the network and could fast-forward tracking
@@ -635,10 +671,12 @@ function Sync-Vault {
         Write-Log "Skipping Obsidian launch — simulating 2s session." "DRYRUN"
         Start-Sleep -Seconds 2
         Write-Log "Simulated session complete." "DRYRUN"
-    } else {
+    }
+    else {
         try {
             $obsidianProc = Start-Process `
                 -FilePath $obsidianPath `
+                -ArgumentList ('"obsidian://open?path={0}"' -f [uri]::EscapeDataString($vaultPath)) `
                 -PassThru `
                 -Wait
 
@@ -649,7 +687,8 @@ function Sync-Vault {
             if ($obsidianProc.ExitCode -ne 0) {
                 Write-Log "Obsidian exited with non-zero code $($obsidianProc.ExitCode). Continuing sync." "WARN"
             }
-        } catch {
+        }
+        catch {
             throw "Failed to launch Obsidian: $_"
         }
     }
@@ -662,7 +701,8 @@ function Sync-Vault {
 
     if (-not $preStageStatus) {
         Write-Log "No changes — vault is clean."
-    } else {
+    }
+    else {
         Write-Log "Changes detected:"
         $preStageStatus | ForEach-Object { Write-Log "  $_" }
 
@@ -689,14 +729,32 @@ function Sync-Vault {
     Write-Log "[5/5] Push..."
 
     if ($committed) {
+        $pushNeeded = $true
+    }
+    else {
+        $aheadCount = & git -C $vaultPath rev-list --count "origin/$branch..HEAD" 2>&1
+        if ($LASTEXITCODE -eq 0 -and [int]$aheadCount -gt 0) {
+            $pushNeeded = $true
+        }
+        elseif ($LASTEXITCODE -ne 0) {
+            $pushNeeded = $true
+        }
+        else {
+            $pushNeeded = $false
+        }
+    }
+
+    if ($pushNeeded) {
         Invoke-Git @("push", "origin", $branch) `
             -WorkDir $vaultPath `
             -SkipInDryRun $true `
             -IsDryRun $dryRun
         Write-Log "Pushed to origin/$branch." "OK"
-    } elseif ($dryRun) {
+    }
+    elseif ($dryRun) {
         Write-Log "Would push to origin/$branch (skipped)." "DRYRUN"
-    } else {
+    }
+    else {
         Write-Log "Nothing to push."
     }
 
@@ -710,7 +768,7 @@ function Sync-Vault {
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-$config   = Read-IniFile -Path $ConfigFile
+$config = Read-IniFile -Path $ConfigFile
 $settings = if ($config.ContainsKey("Settings")) { $config["Settings"] } else { @{} }
 $isDryRun = ($settings["DryRun"] -eq "true")
 
@@ -757,7 +815,8 @@ foreach ($vaultName in $vaultSections) {
 
         $synced.Add($vaultName)
 
-    } catch {
+    }
+    catch {
         # Catch-all for unexpected PowerShell terminating errors (not from Fail).
         # Fail already calls exit 1, so this catches things like null refs, etc.
         $reason = $_.Exception.Message
