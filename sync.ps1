@@ -510,6 +510,9 @@ function Test-Conflicts {
     param([string]$VaultPath)
 
     $status = & git -C $VaultPath status --porcelain 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "git status --porcelain failed (exit $LASTEXITCODE) in: $VaultPath"
+    }
     $conflicts = $status | Where-Object { $_ -match '^(UU|AA|DD|AU|UA|DU|UD)' }
 
     if ($conflicts) {
@@ -530,7 +533,9 @@ function Test-RebaseInProgress {
     param([string]$VaultPath)
 
     $rawGitDir = & git -C $VaultPath rev-parse --git-dir 2>&1
-
+    if ($LASTEXITCODE -ne 0) {
+        throw "git rev-parse --git-dir failed (exit $LASTEXITCODE) in: $VaultPath"
+    }
     # rev-parse --git-dir returns a path relative to $VaultPath when called
     # via -C (e.g. ".git"). Resolve it to absolute before Join-Path so
     # Test-Path works regardless of the script's working directory.
