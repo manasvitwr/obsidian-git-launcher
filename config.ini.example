@@ -1,0 +1,56 @@
+; Obsidian Git Launcher — Configuration
+; Copy this file to config.ini and fill in your values.
+;
+; HOW MULTI-VAULT WORKS
+; ─────────────────────
+; Add one [SectionName] block per vault. The section name is arbitrary —
+; it only appears in logs and the terminal. Vaults sync sequentially, in
+; the order they appear in this file. If one vault fails, the others
+; still run.
+;
+; REQUIRED keys per vault: Path, Branch, ObsidianPath
+; OPTIONAL keys per vault: Remote (only needed if git remote isn't set yet)
+
+; ─────────────────────────────────────────
+; VAULT 1 — Personal notes
+; ─────────────────────────────────────────
+[Personal]
+; Absolute path to the local vault folder (must be a git repo)
+Path=C:\Vaults\Personal
+; GitHub remote URL (HTTPS recommended — works with Git Credential Manager)
+Remote=https://github.com/yourusername/personal-vault.git
+; Branch to sync against
+Branch=main
+; Path to Obsidian executable
+ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
+
+; ─────────────────────────────────────────
+; VAULT 2 — Work notes (syncs after Personal)
+; ─────────────────────────────────────────
+[Work]
+Path=C:\Vaults\Work
+Remote=https://github.com/yourusername/work-vault.git
+Branch=main
+ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
+
+; ─────────────────────────────────────────
+; VAULT 3 — Example: different branch
+; ─────────────────────────────────────────
+; [Archive]
+; Path=C:\Vaults\Archive
+; Remote=https://github.com/yourusername/archive-vault.git
+; Branch=archive
+; ObsidianPath=C:\Users\YourName\AppData\Local\Obsidian\Obsidian.exe
+
+; ─────────────────────────────────────────
+; GLOBAL SETTINGS (applies to all vaults)
+; ─────────────────────────────────────────
+[Settings]
+; Dry run — logs every action but does NOT fetch, pull, commit, or push.
+; Use this to verify your config before the first real sync.
+DryRun=false
+; Commit message template (%DATE% and %TIME% are substituted at runtime)
+CommitMessage=vault sync: %DATE% %TIME%
+; Backup snapshots before push (not yet implemented — placeholder for v2)
+BackupEnabled=false
+BackupDir=.\backups
