@@ -100,6 +100,9 @@ Authentication is handled through Git Credential Manager.
 
 On first push, GitHub login opens in your browser once and is then cached locally.
 
+> [!IMPORTANT]
+> **First-Time Vault Activation**: You must open the vault folder manually in Obsidian at least once (`Open folder as vault` option in Obsidian) before running the launcher. Obsidian's URI protocol handler (`obsidian://open?path=...`) will throw a "Vault not found" error if the folder path is not already cached in Obsidian's known vaults list.
+
 ---
 
 ## Daily usage
