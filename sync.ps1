@@ -322,12 +322,12 @@ function Read-VaultConfig {
     $remote = ""
     do {
         $remote = Read-PromptValue `
-            -Prompt "  GitHub repo URL (HTTPS, e.g. https://github.com/you/vault.git)" `
+            -Prompt "  GitHub repo URL (e.g. https://github.com/you/vault.git or git@github.com:you/vault.git)" `
             -Default "" `
             -AllowEmpty $false
 
-        if ($remote -notmatch '^https?://[^\r\n]+$') {
-            Write-Host "  [WARN] URL should start with https:// and contain no line breaks. Try again." -ForegroundColor Yellow
+        if ($remote -match '[\r\n]') {
+            Write-Host "  [WARN] URL should contain no line breaks. Try again." -ForegroundColor Yellow
             $remote = ""
         }
     } while (-not $remote)
@@ -463,6 +463,20 @@ function Write-IniConfig {
 # ─────────────────────────────────────────
 # GIT HELPERS
 # ─────────────────────────────────────────
+function Test-GitIdentity {
+    param([string]$VaultPath)
+
+    $name = & git -C $VaultPath config user.name 2>&1
+    $email = & git -C $VaultPath config user.email 2>&1
+
+    if (-not $name -or -not $email -or $LASTEXITCODE -ne 0) {
+        Write-Log "Git identity is not configured. Setting a repository-local fallback..." "WARN"
+        & git -C $VaultPath config local user.name "Obsidian Launcher" 2>&1 | Out-Null
+        & git -C $VaultPath config local user.email "launcher@obsidian.local" 2>&1 | Out-Null
+        Write-Log "Configured local user: 'Obsidian Launcher <launcher@obsidian.local>'" "OK"
+    }
+}
+
 function Invoke-Git {
     param(
         [string[]]$Arguments,
@@ -625,6 +639,20 @@ function Sync-Vault {
     }
     $obsidianPath = $obsidianResolved
 
+    # Verify Git Identity so commit doesn't fail later
+    Test-GitIdentity -VaultPath $vaultPath
+
+    # Check for changes before fetching/pulling (pre-sync commit)
+    # This avoids "Cannot pull with rebase: You have unstaged changes"
+    $preSyncStatus = & git -C $vaultPath status --porcelain 2>&1
+    if ($preSyncStatus) {
+        Write-Log "Local changes detected. Committing before pulling..." "INFO"
+        Invoke-Git @("add", "-A") -WorkDir $vaultPath -SkipInDryRun $true -IsDryRun $dryRun
+        $preCommitMsg = "pre-launch: $commitMsg"
+        Invoke-Git @("commit", "-m", $preCommitMsg) `
+            -WorkDir $vaultPath -SkipInDryRun $true -IsDryRun $dryRun
+    }
+
     # Catch a stuck rebase from a previous crashed run before we try to pull.
     Test-RebaseInProgress -VaultPath $vaultPath
 
@@ -641,30 +669,42 @@ function Sync-Vault {
         }
     }
 
-    # ── STEP 1: git fetch ─────────────────────────────────────────────────────
-    # Skipped in dry-run: fetch hits the network and could fast-forward tracking
-    # refs, which is a real side effect. Dry-run should touch nothing.
-    Write-Log "[1/5] Fetching remote..."
-    Invoke-Git @("fetch", "origin") `
-        -WorkDir $vaultPath `
-        -SkipInDryRun $true `
-        -IsDryRun $dryRun
+    # ── STEP 1: git fetch (with Offline Resiliency) ───────────────────────────
+    $offline = $false
+    try {
+        Write-Log "[1/5] Fetching remote..."
+        Invoke-Git @("fetch", "origin") `
+            -WorkDir $vaultPath `
+            -SkipInDryRun $true `
+            -IsDryRun $dryRun
+    }
+    catch {
+        Write-Log "Network fetch failed. Proceeding in OFFLINE mode." "WARN"
+        $offline = $true
+    }
 
     # ── STEP 2: git pull --rebase ─────────────────────────────────────────────
-    # Also skipped in dry-run for the same reason — it rewrites local commits.
-    # Rebase keeps vault history linear (no merge commits on every sync).
-    Write-Log "[2/5] Rebasing onto origin/$branch..."
-    Invoke-Git @("pull", "--rebase", "origin", $branch) `
-        -WorkDir $vaultPath `
-        -SkipInDryRun $true `
-        -IsDryRun $dryRun
-
-    # ── STEP 3: conflict detection ────────────────────────────────────────────
-    # In dry-run we skipped the pull, so there's nothing to check.
-    # In live mode: halt immediately if the rebase left conflict markers.
-    if (-not $dryRun) {
-        Test-RebaseInProgress -VaultPath $vaultPath
-        Test-Conflicts -VaultPath $vaultPath
+    if (-not $offline) {
+        try {
+            Write-Log "[2/5] Rebasing onto origin/$branch..."
+            Invoke-Git @("pull", "--rebase", "origin", $branch) `
+                -WorkDir $vaultPath `
+                -SkipInDryRun $true `
+                -IsDryRun $dryRun
+            
+            # ── STEP 3: conflict detection ────────────────────────────────────
+            if (-not $dryRun) {
+                Test-RebaseInProgress -VaultPath $vaultPath
+                Test-Conflicts -VaultPath $vaultPath
+            }
+        }
+        catch {
+            # If a merge conflict occurred, we must stop and let the user resolve it.
+            if ($_ -match "conflict" -or (Test-Path (Join-Path $vaultPath ".git/REBASE_HEAD"))) {
+                throw $_
+            }
+            Write-Log "Rebase/pull failed. Proceeding with caution..." "WARN"
+        }
     }
     Write-Log "[3/5] Launching Obsidian..." "OK"
 
@@ -682,15 +722,40 @@ function Sync-Vault {
             $obsidianProc = Start-Process `
                 -FilePath $obsidianPath `
                 -ArgumentList ("obsidian://open?path={0}" -f [uri]::EscapeDataString($vaultPath.Replace('\', '/'))) `
-                -PassThru `
-                -Wait
+                -PassThru
 
-            Write-Log "Obsidian exited (PID $($obsidianProc.Id), code $($obsidianProc.ExitCode))." "OK"
-
-            # Non-zero exit is unusual (e.g. crash) but the vault files are fine.
-            # Log loudly and continue — do not abort the commit/push.
-            if ($obsidianProc.ExitCode -ne 0) {
-                Write-Log "Obsidian exited with non-zero code $($obsidianProc.ExitCode). Continuing sync." "WARN"
+            Write-Log "Obsidian launched (PID $($obsidianProc.Id)). Waiting for exit..." "INFO"
+            Start-Sleep -Milliseconds 800
+            
+            if ($obsidianProc.HasExited) {
+                Write-Log "Obsidian process exited immediately (delegated to running instance)." "WARN"
+                Write-Log "Waiting for all Obsidian windows to close, OR press ENTER in this terminal to sync now..." "INFO"
+                while ($true) {
+                    if (-not (Get-Process obsidian -ErrorAction SilentlyContinue)) {
+                        Write-Log "All Obsidian windows closed." "OK"
+                        break
+                    }
+                    if ([Environment]::UserInteractive) {
+                        try {
+                            if ([System.Console]::KeyAvailable) {
+                                $key = [System.Console]::ReadKey($true)
+                                if ($key.Key -eq [System.ConsoleKey]::Enter) {
+                                    Write-Log "Sync triggered manually by user." "INFO"
+                                    break
+                                }
+                            }
+                        } catch {}
+                    }
+                    Start-Sleep -Seconds 2
+                }
+            }
+            else {
+                # Wait for the specific process we started
+                $obsidianProc.WaitForExit()
+                Write-Log "Obsidian exited (PID $($obsidianProc.Id))." "OK"
+                if ($obsidianProc.ExitCode -ne 0) {
+                    Write-Log "Obsidian exited with non-zero code $($obsidianProc.ExitCode). Continuing sync." "WARN"
+                }
             }
         }
         catch {
@@ -756,11 +821,21 @@ function Sync-Vault {
     }
 
     if ($pushNeeded) {
-        Invoke-Git @("push", "origin", $branch) `
-            -WorkDir $vaultPath `
-            -SkipInDryRun $true `
-            -IsDryRun $dryRun
-        Write-Log "Pushed to origin/$branch." "OK"
+        try {
+            Invoke-Git @("push", "origin", $branch) `
+                -WorkDir $vaultPath `
+                -SkipInDryRun $true `
+                -IsDryRun $dryRun
+            Write-Log "Pushed to origin/$branch." "OK"
+        }
+        catch {
+            if ($offline -or $_ -match "unreachable" -or $_ -match "could not resolve host") {
+                Write-Log "Push failed (offline/network error). Your changes are saved locally and will push next time you are online." "WARN"
+            }
+            else {
+                throw $_
+            }
+        }
     }
     elseif ($dryRun) {
         Write-Log "Would push to origin/$branch (skipped)." "DRYRUN"
