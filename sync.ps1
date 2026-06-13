@@ -734,6 +734,8 @@ function Sync-Vault {
             $obsidianProc = Start-Process `
                 -FilePath $obsidianPath `
                 -ArgumentList ("obsidian://open?path={0}" -f [uri]::EscapeDataString($vaultPath.Replace('\', '/'))) `
+                -RedirectStandardOutput "$env:TEMP\obsidian_stdout.log" `
+                -RedirectStandardError "$env:TEMP\obsidian_stderr.log" `
                 -PassThru
 
             Write-Log "Obsidian launched (PID $($obsidianProc.Id)). Waiting for exit..." "INFO"
