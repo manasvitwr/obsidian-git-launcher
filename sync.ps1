@@ -335,11 +335,19 @@ function Read-VaultConfig {
     } while (-not $remote)
 
     # -- Branch --------------------------------
+    $defaultBranch = "main"
+    if (Test-Path $gitDir) {
+        $detected = & git -C $vaultPath rev-parse --abbrev-ref HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $detected) {
+            $defaultBranch = $detected.Trim()
+        }
+    }
+
     $branch = Read-PromptValue `
-        -Prompt "  Branch name [main]" `
-        -Default "main" `
+        -Prompt "  Branch name [$defaultBranch]" `
+        -Default $defaultBranch `
         -AllowEmpty $true
-    if (-not $branch) { $branch = "main" }
+    if (-not $branch) { $branch = $defaultBranch }
 
     # -- Wire up remote (if repo was just init'd or has no remote) --
     $existingRemote = & git -C $vaultPath remote get-url origin 2>$null
@@ -595,7 +603,14 @@ function Sync-Vault {
     $local:ErrorActionPreference = "SilentlyContinue"
 
     $vaultPath = $VaultConfig["Path"]
-    $branch = $VaultConfig["Branch"]
+    # Automatically detect the current checked-out branch, falling back to config value or 'main'
+    $detectedBranch = & git -C $vaultPath rev-parse --abbrev-ref HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $detectedBranch) {
+        $branch = $detectedBranch.Trim()
+    }
+    else {
+        $branch = if ($VaultConfig["Branch"]) { $VaultConfig["Branch"] } else { "main" }
+    }
     $obsidianPath = $VaultConfig["ObsidianPath"]
     $dryRun = ($Settings -and $Settings["DryRun"] -eq "true")
     $commitMsg = if ($Settings -and $Settings["CommitMessage"]) {
