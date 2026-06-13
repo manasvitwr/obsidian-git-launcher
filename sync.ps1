@@ -214,6 +214,8 @@ function Get-VaultLogFile {
 function Invoke-SetupWizard {
     param([string]$OutputPath)
 
+    $local:ErrorActionPreference = "SilentlyContinue"
+
     # -- Banner -------------------------------
     Write-Host ""
     Write-Host "  +==========================================+"
@@ -305,7 +307,7 @@ function Read-VaultConfig {
             -AllowEmpty $true
 
         if ($doInit -notmatch '^[Nn]$') {
-            & git -C $vaultPath init 2>&1 | Out-Null
+            & git -C $vaultPath init 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "  [ERROR] git init failed. Is Git installed?" -ForegroundColor Red
                 exit 1
@@ -340,9 +342,9 @@ function Read-VaultConfig {
     if (-not $branch) { $branch = "main" }
 
     # -- Wire up remote (if repo was just init'd or has no remote) --
-    $existingRemote = & git -C $vaultPath remote get-url origin 2>&1
+    $existingRemote = & git -C $vaultPath remote get-url origin 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $existingRemote) {
-        & git -C $vaultPath remote add origin $remote 2>&1 | Out-Null
+        & git -C $vaultPath remote add origin $remote 2>$null | Out-Null
         Write-Host "  [OK] Remote 'origin' set to $remote"
     }
     else {
@@ -466,13 +468,15 @@ function Write-IniConfig {
 function Test-GitIdentity {
     param([string]$VaultPath)
 
-    $name = & git -C $VaultPath config user.name 2>&1
-    $email = & git -C $VaultPath config user.email 2>&1
+    $local:ErrorActionPreference = "SilentlyContinue"
+
+    $name = & git -C $VaultPath config user.name 2>$null
+    $email = & git -C $VaultPath config user.email 2>$null
 
     if (-not $name -or -not $email -or $LASTEXITCODE -ne 0) {
         Write-Log "Git identity is not configured. Setting a repository-local fallback..." "WARN"
-        & git -C $VaultPath config local user.name "Obsidian Launcher" 2>&1 | Out-Null
-        & git -C $VaultPath config local user.email "launcher@obsidian.local" 2>&1 | Out-Null
+        & git -C $VaultPath config local user.name "Obsidian Launcher" 2>$null | Out-Null
+        & git -C $VaultPath config local user.email "launcher@obsidian.local" 2>$null | Out-Null
         Write-Log "Configured local user: 'Obsidian Launcher <launcher@obsidian.local>'" "OK"
     }
 }
@@ -488,6 +492,8 @@ function Invoke-Git {
         [bool]$SkipInDryRun = $false,
         [bool]$IsDryRun = $false
     )
+
+    $local:ErrorActionPreference = "SilentlyContinue"
 
     $cmdStr = "git $($Arguments -join ' ')"
 
@@ -523,7 +529,9 @@ function Invoke-Git {
 function Test-Conflicts {
     param([string]$VaultPath)
 
-    $status = & git -C $VaultPath status --porcelain 2>&1
+    $local:ErrorActionPreference = "SilentlyContinue"
+
+    $status = & git -C $VaultPath status --porcelain 2>$null
     if ($LASTEXITCODE -ne 0) {
         throw "git status --porcelain failed (exit $LASTEXITCODE) in: $VaultPath"
     }
@@ -546,7 +554,9 @@ function Test-Conflicts {
 function Test-RebaseInProgress {
     param([string]$VaultPath)
 
-    $rawGitDir = & git -C $VaultPath rev-parse --git-dir 2>&1
+    $local:ErrorActionPreference = "SilentlyContinue"
+
+    $rawGitDir = & git -C $VaultPath rev-parse --git-dir 2>$null
     if ($LASTEXITCODE -ne 0) {
         throw "git rev-parse --git-dir failed (exit $LASTEXITCODE) in: $VaultPath"
     }
@@ -581,6 +591,8 @@ function Sync-Vault {
         # Written alongside the session transcript for isolated debugging.
         [string]$VaultLog
     )
+
+    $local:ErrorActionPreference = "SilentlyContinue"
 
     $vaultPath = $VaultConfig["Path"]
     $branch = $VaultConfig["Branch"]
@@ -644,7 +656,7 @@ function Sync-Vault {
 
     # Check for changes before fetching/pulling (pre-sync commit)
     # This avoids "Cannot pull with rebase: You have unstaged changes"
-    $preSyncStatus = & git -C $vaultPath status --porcelain 2>&1
+    $preSyncStatus = & git -C $vaultPath status --porcelain 2>$null
     if ($preSyncStatus) {
         Write-Log "Local changes detected. Committing before pulling..." "INFO"
         Invoke-Git @("add", "-A") -WorkDir $vaultPath -SkipInDryRun $true -IsDryRun $dryRun
@@ -658,13 +670,13 @@ function Sync-Vault {
 
     $remote = $VaultConfig["Remote"]
     if ($remote) {
-        $existingRemote = & git -C $vaultPath remote get-url origin 2>&1
+        $existingRemote = & git -C $vaultPath remote get-url origin 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $existingRemote) {
-            & git -C $vaultPath remote add origin $remote 2>&1 | Out-Null
+            & git -C $vaultPath remote add origin $remote 2>$null | Out-Null
             Write-Log "Remote 'origin' added as $remote" "OK"
         }
         elseif ($existingRemote.Trim() -ne $remote) {
-            & git -C $vaultPath remote set-url origin $remote 2>&1 | Out-Null
+            & git -C $vaultPath remote set-url origin $remote 2>$null | Out-Null
             Write-Log "Remote 'origin' updated to $remote" "OK"
         }
     }
@@ -767,7 +779,7 @@ function Sync-Vault {
     Write-Log "[4/5] Checking for changes..."
 
     # Check status BEFORE staging so we don't run add/commit on a clean tree.
-    $preStageStatus = & git -C $vaultPath status --porcelain 2>&1
+    $preStageStatus = & git -C $vaultPath status --porcelain 2>$null
 
     if (-not $preStageStatus) {
         Write-Log "No changes - vault is clean."
@@ -802,14 +814,14 @@ function Sync-Vault {
         $pushNeeded = $true
     }
     else {
-        $aheadCount = & git -C $vaultPath rev-list --count "origin/$branch..HEAD" 2>&1
+        $aheadCount = & git -C $vaultPath rev-list --count "origin/$branch..HEAD" 2>$null
         if ($LASTEXITCODE -eq 0 -and [int]$aheadCount -gt 0) {
             $pushNeeded = $true
         }
         elseif ($LASTEXITCODE -ne 0) {
             # rev-list failed - likely because origin/$branch doesn't exist yet.
             # Check whether the remote has the branch at all before deciding to push.
-            $lsRemote = & git -C $vaultPath ls-remote --heads origin $branch 2>&1
+            $lsRemote = & git -C $vaultPath ls-remote --heads origin $branch 2>$null
             if ($LASTEXITCODE -eq 0 -and -not $lsRemote) {
                 Write-Log "Branch '$branch' not found on remote - will push to create it." "WARN"
             }
